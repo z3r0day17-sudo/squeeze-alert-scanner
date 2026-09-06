@@ -2,10 +2,8 @@ name: Squeeze Scanner
 
 on:
   schedule:
-    # Every 15 minutes, Monday-Friday
     - cron: "*/15 * * * 1-5"
 
-  # Lets you test it manually from GitHub
   workflow_dispatch:
 
 jobs:
