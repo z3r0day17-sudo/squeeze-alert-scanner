@@ -2,11 +2,11 @@ name: Squeeze Scanner
 
 on:
   schedule:
-    # Run every 15 minutes, Monday-Friday.
-    # scanner.py handles the actual 9:30 AM-4:00 PM ET market-hours check.
+    # Run every 15 minutes on weekdays.
+    # scanner.py decides whether the U.S. market is actually open.
     - cron: "*/15 * * * 1-5"
 
-  # Allows manual testing from the GitHub Actions tab
+  # Lets you run the scanner manually from GitHub Actions.
   workflow_dispatch:
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Dynamic Squeeze Scanner
+      - name: Run Squeeze Scanner
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           PYTHONUNBUFFERED: "1"
