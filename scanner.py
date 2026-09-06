@@ -6,31 +6,30 @@ import yfinance as yf
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Stocks to monitor
-WATCHLIST = [
-    "ASAN",
-    "GPRO",
-    "UPST",
-    "KSS",
-    "BYND",
-    "AI",
-    "PLUG",
-    "OPEN",
-    "RKT",
-]
+# ============================================================
+# SETTINGS
+# ============================================================
 
-# Medium-risk filters
 MIN_PRICE = 3.00
 MAX_PRICE = 60.00
+
 MIN_RELATIVE_VOLUME = 1.50
 MIN_DAILY_GAIN = 2.0
 MAX_DAILY_GAIN = 25.0
-MIN_AVG_DOLLAR_VOLUME = 10_000_000
-MIN_SCORE = 70
 
-# Options liquidity protection
+MIN_SHORT_FLOAT = 10.0
+MIN_AVG_DOLLAR_VOLUME = 10_000_000
+
+MIN_SCORE = 70
 MAX_OPTION_SPREAD = 0.15
 
+MAX_CANDIDATES_TO_SCAN = 50
+MAX_ALERTS_PER_RUN = 3
+
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def safe_float(value, default=0.0):
     try:
@@ -63,6 +62,74 @@ def send_discord_message(message):
     except requests.RequestException as error:
         print(f"Discord error: {error}")
 
+
+# ============================================================
+# DYNAMIC CANDIDATE DISCOVERY
+# ============================================================
+
+def get_dynamic_candidates():
+    """
+    Pull candidates dynamically from Yahoo Finance screeners.
+    No fixed watchlist.
+    """
+
+    symbols = set()
+
+    screener_urls = [
+        "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=100",
+        "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=100",
+        "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=small_cap_gainers&count=100",
+    ]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    for url in screener_urls:
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=20,
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            results = (
+                data
+                .get("finance", {})
+                .get("result", [])
+            )
+
+            if not results:
+                continue
+
+            quotes = results[0].get("quotes", [])
+
+            for quote in quotes:
+                symbol = quote.get("symbol")
+
+                if symbol:
+                    symbols.add(symbol)
+
+        except Exception as error:
+            print(f"Screener error: {error}")
+
+    candidates = list(symbols)
+
+    print(
+        f"Dynamic discovery found "
+        f"{len(candidates)} unique symbols."
+    )
+
+    return candidates[:MAX_CANDIDATES_TO_SCAN]
+
+
+# ============================================================
+# VOLUME CALCULATIONS
+# ============================================================
 
 def calculate_relative_volume(history):
     if len(history) < 21:
@@ -99,6 +166,10 @@ def calculate_average_dollar_volume(history):
     )
 
 
+# ============================================================
+# SQUEEZE SCORE
+# ============================================================
+
 def calculate_score(
     daily_gain,
     relative_volume,
@@ -109,7 +180,7 @@ def calculate_score(
     score = 0
     reasons = []
 
-    # Short interest
+    # Short float
     if short_percent >= 25:
         score += 30
         reasons.append(
@@ -130,6 +201,9 @@ def calculate_score(
 
     elif short_percent >= 10:
         score += 10
+        reasons.append(
+            f"Short float: {short_percent:.1f}%"
+        )
 
     # Days to cover
     if days_to_cover >= 5:
@@ -166,7 +240,7 @@ def calculate_score(
             f"Relative volume: {relative_volume:.1f}x"
         )
 
-    # Momentum
+    # Price momentum
     if 5 <= daily_gain <= 15:
         score += 15
         reasons.append(
@@ -198,6 +272,10 @@ def calculate_score(
     return min(score, 100), reasons
 
 
+# ============================================================
+# OPTIONS
+# ============================================================
+
 def find_call_candidates(stock, price):
     try:
         expirations = stock.options
@@ -207,15 +285,15 @@ def find_call_candidates(stock, price):
 
         candidates = []
 
-        # Check several near-term expirations
         for expiration in expirations[:4]:
+
             chain = stock.option_chain(expiration)
+
             calls = chain.calls.copy()
 
             if calls.empty:
                 continue
 
-            # Near-the-money through moderately OTM
             calls = calls[
                 (calls["strike"] >= price * 0.95)
                 & (calls["strike"] <= price * 1.20)
@@ -251,11 +329,9 @@ def find_call_candidates(stock, price):
                     (ask - bid) / midpoint
                 )
 
-                # Reject wide spreads
                 if spread > MAX_OPTION_SPREAD:
                     continue
 
-                # Reject thin contracts
                 if open_interest < 100:
                     continue
 
@@ -286,13 +362,14 @@ def find_call_candidates(stock, price):
         conservative = None
         aggressive = None
 
-        # ATM/slightly ITM
         for option in candidates:
-            if option["strike"] <= price * 1.03:
+            if (
+                option["strike"] >= price * 0.97
+                and option["strike"] <= price * 1.03
+            ):
                 conservative = option
                 break
 
-        # Moderately OTM
         for option in candidates:
             if (
                 option["strike"] >= price * 1.05
@@ -320,7 +397,12 @@ def find_call_candidates(stock, price):
         return []
 
 
+# ============================================================
+# STOCK ANALYSIS
+# ============================================================
+
 def analyze_stock(symbol):
+
     print(f"Scanning {symbol}...")
 
     try:
@@ -353,13 +435,18 @@ def analyze_stock(symbol):
             / previous_close
         ) * 100
 
-        # Avoid chasing stocks already up too much
+        if daily_gain < MIN_DAILY_GAIN:
+            return None
+
         if daily_gain > MAX_DAILY_GAIN:
             return None
 
         relative_volume = calculate_relative_volume(
             history
         )
+
+        if relative_volume < MIN_RELATIVE_VOLUME:
+            return None
 
         avg_dollar_volume = (
             calculate_average_dollar_volume(
@@ -388,8 +475,12 @@ def analyze_stock(symbol):
 
         if shares_short > 0 and float_shares > 0:
             short_percent = (
-                shares_short / float_shares
+                shares_short
+                / float_shares
             ) * 100
+
+        if short_percent < MIN_SHORT_FLOAT:
+            return None
 
         days_to_cover = 0
 
@@ -427,15 +518,20 @@ def analyze_stock(symbol):
         return None
 
 
+# ============================================================
+# ALERT MESSAGE
+# ============================================================
+
 def create_alert(result):
+
     symbol = result["symbol"]
     score = result["score"]
     price = result["price"]
+
     short_percent = result["short_percent"]
     days_to_cover = result["days_to_cover"]
     relative_volume = result["relative_volume"]
     daily_gain = result["daily_gain"]
-    reasons = result["reasons"]
 
     option_candidates = find_call_candidates(
         result["stock"],
@@ -452,17 +548,18 @@ def create_alert(result):
         f"📊 **Relative Volume:** {relative_volume:.1f}x\n\n"
     )
 
-    if reasons:
+    if result["reasons"]:
+
         message += "**Why it triggered:**\n"
 
-        for reason in reasons:
+        for reason in result["reasons"]:
             message += f"• {reason}\n"
 
     message += "\n"
 
     if option_candidates:
 
-        message += "**Call candidates:**\n"
+        message += "**Potential call contracts:**\n"
 
         for risk, option in option_candidates:
 
@@ -479,25 +576,34 @@ def create_alert(result):
             )
 
     else:
+
         message += (
             "⚠️ **Options:** PASS — "
             "no sufficiently liquid call contract found.\n"
         )
 
     message += (
-        "\n⚠️ Squeeze Watch only. "
-        "Verify current news, pricing, and risk before trading."
+        "\n⚠️ **Squeeze-watch signal only. "
+        "Verify current news, options pricing, "
+        "and risk before trading.**"
     )
 
     return message
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def run_scanner():
-    print("Starting Squeeze Alert Scanner...")
+
+    print("Starting dynamic Squeeze Alert Scanner...")
+
+    symbols = get_dynamic_candidates()
 
     alerts = []
 
-    for symbol in WATCHLIST:
+    for symbol in symbols:
 
         result = analyze_stock(symbol)
 
@@ -508,35 +614,30 @@ def run_scanner():
             f"{symbol}: "
             f"score={result['score']} "
             f"RVOL={result['relative_volume']:.2f}x "
-            f"short={result['short_percent']:.1f}%"
+            f"short={result['short_percent']:.1f}% "
+            f"gain={result['daily_gain']:.1f}%"
         )
 
-        if (
-            result["score"] >= MIN_SCORE
-            and result["relative_volume"]
-            >= MIN_RELATIVE_VOLUME
-            and result["daily_gain"]
-            >= MIN_DAILY_GAIN
-        ):
+        if result["score"] >= MIN_SCORE:
             alerts.append(result)
 
-    # Highest scores first
     alerts.sort(
         key=lambda x: x["score"],
         reverse=True,
     )
 
-    # Maximum of three alerts per scan
-    alerts = alerts[:3]
+    alerts = alerts[:MAX_ALERTS_PER_RUN]
 
     for result in alerts:
+
         send_discord_message(
             create_alert(result)
         )
 
     if not alerts:
         print(
-            "No stocks met the squeeze threshold."
+            "No stocks currently meet "
+            "the squeeze-alert threshold."
         )
 
     print("Scan complete.")
